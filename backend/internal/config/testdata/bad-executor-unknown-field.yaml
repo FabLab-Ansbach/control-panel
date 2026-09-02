@@ -1,0 +1,7 @@
+secretKey: super-secret
+executors:
+  restrict-inet:
+    type: opnsenseAliasToggle
+    connectorName: firewall
+    aliasName: workshop-clients
+    toggleValua: 10.0.10.55

@@ -1,0 +1,14 @@
+baseUrl: https://example.com
+secretKey: super-secret
+connectors:
+  firewall:
+    type: opnsense
+    baseUrl: https://opnsense.example.com
+    apiKey: key
+    apiSecret: secret
+executors:
+  restrict-inet:
+    type: opnsenseAliasToggle
+    connectorName: firewall
+    aliasName: workshop-clients
+    toggleValue: 10.0.10.55

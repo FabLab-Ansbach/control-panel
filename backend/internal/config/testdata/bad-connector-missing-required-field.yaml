@@ -1,0 +1,6 @@
+secretKey: super-secret
+connectors:
+  firewall:
+    type: opnsense
+    baseUrl: https://opnsense.example.com
+    apiKey: key

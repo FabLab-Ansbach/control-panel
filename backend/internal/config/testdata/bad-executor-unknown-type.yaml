@@ -1,0 +1,4 @@
+secretKey: super-secret
+executors:
+  restrict-inet:
+    type: dnsToggleRecord

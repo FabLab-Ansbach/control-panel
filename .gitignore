@@ -1,0 +1,23 @@
+# planning artifacts — not part of the shipped project
+/requirements.md
+/plan/
+/IMPLEMENTATION_STATE.md
+
+# backend
+/backend/control-panel
+/bin/
+*.test
+
+# frontend
+/frontend/node_modules/
+/frontend/dist/
+
+# local config with secrets
+/deploy/config.yaml
+/deploy/*.local.yaml
+
+# editors / OS
+.DS_Store
+*.swp
+
+config.yaml

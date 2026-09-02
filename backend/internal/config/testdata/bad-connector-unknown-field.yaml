@@ -1,0 +1,6 @@
+baseUrl: https://example.com
+secretKey: super-secret
+connectors:
+  firewall:
+    type: opnsense
+    extraField: nope

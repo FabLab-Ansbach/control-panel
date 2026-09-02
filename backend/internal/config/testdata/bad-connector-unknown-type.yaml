@@ -1,0 +1,4 @@
+secretKey: super-secret
+connectors:
+  firewall:
+    type: dns
