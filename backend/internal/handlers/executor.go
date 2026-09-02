@@ -5,23 +5,30 @@ import (
 	"net/http"
 	"sort"
 
+	"github.com/FabLab-Ansbach/control-panel/internal/authn"
+	"github.com/FabLab-Ansbach/control-panel/internal/authz"
+	"github.com/FabLab-Ansbach/control-panel/internal/config"
 	"github.com/FabLab-Ansbach/control-panel/internal/executors"
 )
 
-func GetExecutorRouter(execs map[string]executors.Executor) http.Handler {
+func GetExecutorRouter(execs map[string]executors.Executor, perms config.PermissionsConfig) http.Handler {
 	mux := http.NewServeMux()
-	mux.HandleFunc("GET /{$}", listHandler(execs))
-	mux.HandleFunc("GET /{name}", itemHandler(execs))
-	mux.HandleFunc("POST /{name}/execute", executeHandler(execs))
+	mux.HandleFunc("GET /{$}", listHandler(execs, perms))
+	mux.HandleFunc("GET /{name}", itemHandler(execs, perms))
+	mux.HandleFunc("POST /{name}/execute", executeHandler(execs, perms))
 
 	return mux
 }
 
-func listHandler(execs map[string]executors.Executor) http.HandlerFunc {
+func listHandler(execs map[string]executors.Executor, perms config.PermissionsConfig) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
+		groups := authn.GroupsFromContext(r.Context())
+
 		names := make([]string, 0, len(execs))
 		for name := range execs {
-			names = append(names, name)
+			if authz.Allowed(perms, groups, name, config.AccessLevelRO) {
+				names = append(names, name)
+			}
 		}
 		sort.Strings(names)
 
@@ -36,11 +43,16 @@ func listHandler(execs map[string]executors.Executor) http.HandlerFunc {
 	}
 }
 
-func itemHandler(execs map[string]executors.Executor) http.HandlerFunc {
+func itemHandler(execs map[string]executors.Executor, perms config.PermissionsConfig) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		e, ok := execs[r.PathValue("name")]
+		name := r.PathValue("name")
+		e, ok := execs[name]
 		if !ok {
 			http.NotFound(w, r)
+			return
+		}
+		if !authz.Allowed(perms, authn.GroupsFromContext(r.Context()), name, config.AccessLevelRO) {
+			http.Error(w, "forbidden", http.StatusForbidden)
 			return
 		}
 
@@ -49,11 +61,16 @@ func itemHandler(execs map[string]executors.Executor) http.HandlerFunc {
 	}
 }
 
-func executeHandler(execs map[string]executors.Executor) http.HandlerFunc {
+func executeHandler(execs map[string]executors.Executor, perms config.PermissionsConfig) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		e, ok := execs[r.PathValue("name")]
+		name := r.PathValue("name")
+		e, ok := execs[name]
 		if !ok {
 			http.NotFound(w, r)
+			return
+		}
+		if !authz.Allowed(perms, authn.GroupsFromContext(r.Context()), name, config.AccessLevelRW) {
+			http.Error(w, "forbidden", http.StatusForbidden)
 			return
 		}
 

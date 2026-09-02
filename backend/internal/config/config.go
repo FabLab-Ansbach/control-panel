@@ -11,18 +11,38 @@ import (
 )
 
 type Config struct {
-	BaseURL    string           `yaml:"baseUrl"`
-	SecretKey  string           `yaml:"secretKey"`
-	AuthConfig *OIDCAuthConfig  `yaml:"authConfig"`
-	Connectors ConnectorsConfig `yaml:"connectors"`
-	Executors  ExecutorConfig   `yaml:"executors"`
+	BaseURL     string            `yaml:"baseUrl"`
+	SecretKey   string            `yaml:"secretKey"`
+	AuthConfig  *OIDCAuthConfig   `yaml:"authConfig"`
+	Connectors  ConnectorsConfig  `yaml:"connectors"`
+	Executors   ExecutorConfig    `yaml:"executors"`
+	Permissions PermissionsConfig `yaml:"permissions"`
+	// FrontendDir, if set, serves the static GUI from this directory at "/".
+	FrontendDir string `yaml:"frontendDir"`
 }
 
 type OIDCAuthConfig struct {
 	IssuerURL    string `yaml:"issuerUrl" validate:"required"`
 	ClientID     string `yaml:"clientId" validate:"required"`
 	ClientSecret string `yaml:"clientSecret" validate:"required"`
+	RedirectURL  string `yaml:"redirectUrl" validate:"required"`
 }
+
+// PermissionsConfig maps an OIDC group name to what it may do.
+type PermissionsConfig map[string]GroupPermission
+
+type GroupPermission struct {
+	// Root grants RW access to every executor, present or future.
+	Root      bool                   `yaml:"root"`
+	Executors map[string]AccessLevel `yaml:"executors"`
+}
+
+type AccessLevel string
+
+const (
+	AccessLevelRO AccessLevel = "ro"
+	AccessLevelRW AccessLevel = "rw"
+)
 
 type ConnectorsConfig map[string]ConnectorDefinition
 
@@ -113,7 +133,22 @@ func LoadConfig(path string) (*Config, error) {
 		return nil, err
 	}
 
+	if err := validatePermissions(config.Permissions); err != nil {
+		return nil, err
+	}
+
 	return config, nil
+}
+
+func validatePermissions(cfg PermissionsConfig) error {
+	for group, permission := range cfg {
+		for executor, level := range permission.Executors {
+			if level != AccessLevelRO && level != AccessLevelRW {
+				return fmt.Errorf("permissions.%s.executors.%s: invalid access level %q, expected %q or %q", group, executor, level, AccessLevelRO, AccessLevelRW)
+			}
+		}
+	}
+	return nil
 }
 
 type Connector struct{}
