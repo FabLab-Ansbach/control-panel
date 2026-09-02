@@ -13,6 +13,7 @@ type Executor interface {
 	Execute(ctx context.Context) (bool, error)
 	Status(ctx context.Context) (bool, error)
 	Name() string
+	Connector() connectors.Connector
 }
 
 type Factory func(config.ExecutorDefinition, connectors.Set) (Executor, error)

@@ -1,0 +1,105 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>FabLab Control Panel</title>
+<style>
+  body { font-family: system-ui, sans-serif; max-width: 640px; margin: 2rem auto; padding: 0 1rem; }
+  h1 { font-size: 1.25rem; }
+  .executor { display: flex; align-items: center; gap: 1rem; padding: 0.75rem; border: 1px solid #ddd; border-radius: 6px; margin-bottom: 0.5rem; }
+  .executor .name { font-weight: bold; flex: 1; }
+  .executor .connector { color: #666; font-size: 0.85rem; }
+  .state { padding: 0.15rem 0.5rem; border-radius: 4px; font-size: 0.85rem; }
+  .state.on { background: #d4f7d4; color: #1a7a1a; }
+  .state.off { background: #eee; color: #555; }
+  .state.error { background: #fbdada; color: #a11; }
+  button { cursor: pointer; }
+</style>
+</head>
+<body>
+  <h1>Executors</h1>
+  <div id="executors">Loading…</div>
+
+<script>
+const API_BASE = "http://localhost:8090";
+
+async function fetchExecutors() {
+  const res = await fetch(`${API_BASE}/executors`);
+  if (!res.ok) throw new Error(`GET /executors failed: ${res.status}`);
+  return res.json();
+}
+
+async function executeExecutor(name) {
+  const res = await fetch(`${API_BASE}/executors/${encodeURIComponent(name)}/execute`, { method: "POST" });
+  return res.json();
+}
+
+function render(executors) {
+  const container = document.getElementById("executors");
+  container.innerHTML = "";
+
+  for (const e of executors) {
+    const row = document.createElement("div");
+    row.className = "executor";
+
+    const name = document.createElement("div");
+    name.className = "name";
+    name.textContent = e.name;
+    const connector = document.createElement("div");
+    connector.className = "connector";
+    connector.textContent = `${e.connectorName} (${e.connectorType})`;
+    name.appendChild(document.createElement("br"));
+    name.appendChild(connector);
+
+    const state = document.createElement("span");
+    if (e.error) {
+      state.className = "state error";
+      state.textContent = e.error;
+    } else {
+      state.className = "state " + (e.state ? "on" : "off");
+      state.textContent = e.state ? "on" : "off";
+    }
+
+    const button = document.createElement("button");
+    button.textContent = "Execute";
+    button.onclick = async () => {
+      button.disabled = true;
+      try {
+        const result = await executeExecutor(e.name);
+        updateRow(state, result);
+      } catch (err) {
+        state.className = "state error";
+        state.textContent = String(err);
+      } finally {
+        button.disabled = false;
+      }
+    };
+
+    row.append(name, state, button);
+    container.appendChild(row);
+  }
+}
+
+function updateRow(stateEl, result) {
+  if (result.error) {
+    stateEl.className = "state error";
+    stateEl.textContent = result.error;
+  } else {
+    stateEl.className = "state " + (result.state ? "on" : "off");
+    stateEl.textContent = result.state ? "on" : "off";
+  }
+}
+
+async function refresh() {
+  try {
+    render(await fetchExecutors());
+  } catch (err) {
+    document.getElementById("executors").textContent = String(err);
+  }
+}
+
+refresh();
+setInterval(refresh, 5000);
+</script>
+</body>
+</html>
