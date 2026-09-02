@@ -18,8 +18,10 @@ import (
 )
 
 const (
-	sessionCookieName = "session"
-	stateCookieName   = "oauth_state"
+	sessionCookieName   = "session"
+	refreshCookieName   = "refresh"
+	stateCookieName     = "oauth_state"
+	refreshCookieMaxAge = 30 * 24 * time.Hour
 )
 
 type groupsCtxKey struct{}
@@ -39,12 +41,14 @@ func WithGroups(ctx context.Context, groups []string) context.Context {
 }
 
 // Authenticator handles the GUI's OIDC authorization-code login (confidential
-// client, server-side session) and validates bearer JWTs from M2M clients.
+// client) and validates bearer JWTs from M2M clients. There is no
+// server-side session store: the browser's session cookie holds the signed
+// id_token itself, re-verified on every request, and a separate cookie holds
+// the refresh_token so an expired session can be silently renewed.
 type Authenticator struct {
 	oauth2Config    oauth2.Config
 	idTokenVerifier *oidc.IDTokenVerifier
 	bearerVerifier  *oidc.IDTokenVerifier
-	sessions        *sessionStore
 }
 
 func New(ctx context.Context, cfg config.OIDCAuthConfig) (*Authenticator, error) {
@@ -59,11 +63,10 @@ func New(ctx context.Context, cfg config.OIDCAuthConfig) (*Authenticator, error)
 			ClientSecret: cfg.ClientSecret,
 			RedirectURL:  cfg.RedirectURL,
 			Endpoint:     provider.Endpoint(),
-			Scopes:       []string{oidc.ScopeOpenID, "profile", "groups"},
+			Scopes:       []string{oidc.ScopeOpenID, "profile", "groups", "offline_access"},
 		},
 		idTokenVerifier: provider.Verifier(&oidc.Config{ClientID: cfg.ClientID}),
 		bearerVerifier:  provider.Verifier(&oidc.Config{SkipClientIDCheck: true}),
-		sessions:        newSessionStore(),
 	}, nil
 }
 
@@ -83,7 +86,7 @@ func (a *Authenticator) LoginHandler(w http.ResponseWriter, r *http.Request) {
 }
 
 // CallbackHandler exchanges the authorization code (using our client secret),
-// verifies the id_token, and starts a server-side session for the caller's groups.
+// verifies the id_token, and stores it (plus any refresh_token) in cookies.
 func (a *Authenticator) CallbackHandler(w http.ResponseWriter, r *http.Request) {
 	stateCookie, err := r.Cookie(stateCookieName)
 	if err != nil || r.URL.Query().Get("state") != stateCookie.Value {
@@ -113,36 +116,15 @@ func (a *Authenticator) CallbackHandler(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 
-	var claims struct {
-		Groups []string `json:"groups"`
-	}
-	if err := idToken.Claims(&claims); err != nil {
-		slog.ErrorContext(r.Context(), "failed to parse id_token claims", "err", err)
-		http.Error(w, "invalid claims", http.StatusUnauthorized)
-		return
-	}
-
 	reqlog.SetUser(r.Context(), idToken.Subject)
-
-	sessionID := a.sessions.create(claims.Groups, idToken.Subject, time.Until(idToken.Expiry))
-	http.SetCookie(w, &http.Cookie{
-		Name:     sessionCookieName,
-		Value:    sessionID,
-		Path:     "/",
-		HttpOnly: true,
-		Secure:   r.TLS != nil,
-		SameSite: http.SameSiteLaxMode,
-		Expires:  idToken.Expiry,
-	})
+	a.setSessionCookies(w, r, rawIDToken, token.RefreshToken, idToken.Expiry)
 	http.Redirect(w, r, "/", http.StatusFound)
 }
 
-// LogoutHandler clears the caller's session.
+// LogoutHandler clears the caller's session and refresh cookies.
 func (a *Authenticator) LogoutHandler(w http.ResponseWriter, r *http.Request) {
-	if cookie, err := r.Cookie(sessionCookieName); err == nil {
-		a.sessions.delete(cookie.Value)
-	}
 	clearCookie(w, sessionCookieName)
+	clearCookie(w, refreshCookieName)
 	http.Redirect(w, r, "/", http.StatusFound)
 }
 
@@ -151,7 +133,7 @@ func (a *Authenticator) LogoutHandler(w http.ResponseWriter, r *http.Request) {
 // or the GUI's session cookie, and puts their groups on the request context.
 func (a *Authenticator) RequireAuth(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		groups, user, ok := a.authenticate(r)
+		groups, user, ok := a.authenticate(w, r)
 		if !ok {
 			http.Error(w, "unauthorized", http.StatusUnauthorized)
 			return
@@ -161,16 +143,80 @@ func (a *Authenticator) RequireAuth(next http.Handler) http.Handler {
 	})
 }
 
-func (a *Authenticator) authenticate(r *http.Request) (groups []string, user string, ok bool) {
+func (a *Authenticator) authenticate(w http.ResponseWriter, r *http.Request) (groups []string, user string, ok bool) {
 	if header := r.Header.Get("Authorization"); header != "" {
 		return a.authenticateBearer(r.Context(), header)
 	}
+	return a.authenticateSessionCookie(w, r)
+}
 
+func (a *Authenticator) authenticateSessionCookie(w http.ResponseWriter, r *http.Request) (groups []string, user string, ok bool) {
 	cookie, err := r.Cookie(sessionCookieName)
 	if err != nil {
 		return nil, "", false
 	}
-	return a.sessions.get(cookie.Value)
+
+	idToken, err := a.idTokenVerifier.Verify(r.Context(), cookie.Value)
+	if err != nil {
+		// Most commonly this just means the id_token expired — try to
+		// silently renew it from the refresh cookie before giving up.
+		return a.refreshSession(w, r)
+	}
+
+	return groupsAndUserFromToken(r.Context(), idToken)
+}
+
+func (a *Authenticator) refreshSession(w http.ResponseWriter, r *http.Request) (groups []string, user string, ok bool) {
+	refreshCookie, err := r.Cookie(refreshCookieName)
+	if err != nil {
+		return nil, "", false
+	}
+
+	src := a.oauth2Config.TokenSource(r.Context(), &oauth2.Token{RefreshToken: refreshCookie.Value})
+	token, err := src.Token()
+	if err != nil {
+		slog.ErrorContext(r.Context(), "refresh token exchange failed", "err", err)
+		return nil, "", false
+	}
+
+	rawIDToken, hasIDToken := token.Extra("id_token").(string)
+	if !hasIDToken {
+		slog.ErrorContext(r.Context(), "refresh response had no id_token")
+		return nil, "", false
+	}
+
+	idToken, err := a.idTokenVerifier.Verify(r.Context(), rawIDToken)
+	if err != nil {
+		slog.ErrorContext(r.Context(), "refreshed id_token verification failed", "err", err)
+		return nil, "", false
+	}
+
+	a.setSessionCookies(w, r, rawIDToken, token.RefreshToken, idToken.Expiry)
+	return groupsAndUserFromToken(r.Context(), idToken)
+}
+
+func (a *Authenticator) setSessionCookies(w http.ResponseWriter, r *http.Request, rawIDToken, refreshToken string, expiry time.Time) {
+	http.SetCookie(w, &http.Cookie{
+		Name:     sessionCookieName,
+		Value:    rawIDToken,
+		Path:     "/",
+		HttpOnly: true,
+		Secure:   r.TLS != nil,
+		SameSite: http.SameSiteLaxMode,
+		Expires:  expiry,
+	})
+
+	if refreshToken != "" {
+		http.SetCookie(w, &http.Cookie{
+			Name:     refreshCookieName,
+			Value:    refreshToken,
+			Path:     "/",
+			HttpOnly: true,
+			Secure:   r.TLS != nil,
+			SameSite: http.SameSiteLaxMode,
+			MaxAge:   int(refreshCookieMaxAge / time.Second),
+		})
+	}
 }
 
 func (a *Authenticator) authenticateBearer(ctx context.Context, header string) (groups []string, user string, ok bool) {
@@ -185,14 +231,17 @@ func (a *Authenticator) authenticateBearer(ctx context.Context, header string) (
 		return nil, "", false
 	}
 
+	return groupsAndUserFromToken(ctx, idToken)
+}
+
+func groupsAndUserFromToken(ctx context.Context, idToken *oidc.IDToken) (groups []string, user string, ok bool) {
 	var claims struct {
 		Groups []string `json:"groups"`
 	}
 	if err := idToken.Claims(&claims); err != nil {
-		slog.ErrorContext(ctx, "failed to parse bearer token claims", "err", err)
+		slog.ErrorContext(ctx, "failed to parse id_token claims", "err", err)
 		return nil, "", false
 	}
-
 	return claims.Groups, idToken.Subject, true
 }
 

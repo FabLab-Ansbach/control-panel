@@ -50,10 +50,11 @@ func newFakeProvider(t *testing.T) *fakeProvider {
 		idToken := fp.sign(t, fp.claims)
 		w.Header().Set("Content-Type", "application/json")
 		json.NewEncoder(w).Encode(map[string]any{
-			"access_token": "unused-access-token",
-			"id_token":     idToken,
-			"token_type":   "Bearer",
-			"expires_in":   3600,
+			"access_token":  "unused-access-token",
+			"id_token":      idToken,
+			"refresh_token": "fake-refresh-token",
+			"token_type":    "Bearer",
+			"expires_in":    3600,
 		})
 	})
 
@@ -78,12 +79,16 @@ func (fp *fakeProvider) sign(t *testing.T, claims map[string]any) string {
 }
 
 func baseClaims(fp *fakeProvider, audience string, groups []string) map[string]any {
+	return claimsWithTTL(fp, audience, groups, time.Hour)
+}
+
+func claimsWithTTL(fp *fakeProvider, audience string, groups []string, ttl time.Duration) map[string]any {
 	now := time.Now()
 	return map[string]any{
 		"iss":    fp.srv.URL,
 		"aud":    audience,
 		"sub":    "test-subject",
-		"exp":    now.Add(time.Hour).Unix(),
+		"exp":    now.Add(ttl).Unix(),
 		"iat":    now.Unix(),
 		"groups": groups,
 	}
@@ -144,14 +149,20 @@ func TestLoginCallbackEstablishesSession(t *testing.T) {
 		body, _ := json.Marshal(callbackRec.Body.String())
 		t.Fatalf("callback status = %d, want %d, body=%s", callbackResp.StatusCode, http.StatusFound, body)
 	}
-	var sessionCookie *http.Cookie
+	var sessionCookie, refreshCookie *http.Cookie
 	for _, c := range callbackResp.Cookies() {
-		if c.Name == sessionCookieName {
+		switch c.Name {
+		case sessionCookieName:
 			sessionCookie = c
+		case refreshCookieName:
+			refreshCookie = c
 		}
 	}
-	if sessionCookie == nil {
-		t.Fatal("expected session cookie to be set")
+	if sessionCookie == nil || sessionCookie.Value == "" {
+		t.Fatal("expected session cookie (the raw id_token) to be set")
+	}
+	if refreshCookie == nil || refreshCookie.Value == "" {
+		t.Fatal("expected refresh cookie to be set")
 	}
 
 	// A request carrying the session cookie should authenticate as the GUI user's groups.
@@ -233,4 +244,62 @@ func TestRequireAuthBearerToken(t *testing.T) {
 			t.Fatalf("status = %d, want 401", rec.Code)
 		}
 	})
+}
+
+func TestExpiredSessionIsSilentlyRefreshed(t *testing.T) {
+	fp := newFakeProvider(t)
+	auth := newTestAuthenticator(t, fp)
+
+	expiredIDToken := fp.sign(t, claimsWithTTL(fp, "gui-client", []string{"fablab-admins"}, -time.Minute))
+
+	// The refresh endpoint will hand back fresh claims - a different set of
+	// groups, so we can prove the refreshed token (not the stale cookie) is
+	// what actually got used for authorization.
+	fp.claims = baseClaims(fp, "gui-client", []string{"fablab-members"})
+
+	var gotGroups []string
+	protected := auth.RequireAuth(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotGroups = GroupsFromContext(r.Context())
+	}))
+
+	req := httptest.NewRequest(http.MethodGet, "/executors", nil)
+	req.AddCookie(&http.Cookie{Name: sessionCookieName, Value: expiredIDToken})
+	req.AddCookie(&http.Cookie{Name: refreshCookieName, Value: "some-refresh-token"})
+	rec := httptest.NewRecorder()
+	protected.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200, body=%s", rec.Code, rec.Body.String())
+	}
+	if len(gotGroups) != 1 || gotGroups[0] != "fablab-members" {
+		t.Fatalf("groups = %v, want [fablab-members] (from the refreshed token)", gotGroups)
+	}
+
+	var newSessionCookie *http.Cookie
+	for _, c := range rec.Result().Cookies() {
+		if c.Name == sessionCookieName {
+			newSessionCookie = c
+		}
+	}
+	if newSessionCookie == nil || newSessionCookie.Value == expiredIDToken {
+		t.Fatal("expected a new, different session cookie to be set after refresh")
+	}
+}
+
+func TestExpiredSessionWithoutRefreshCookieIsRejected(t *testing.T) {
+	fp := newFakeProvider(t)
+	auth := newTestAuthenticator(t, fp)
+
+	expiredIDToken := fp.sign(t, claimsWithTTL(fp, "gui-client", []string{"fablab-admins"}, -time.Minute))
+
+	protected := auth.RequireAuth(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {}))
+
+	req := httptest.NewRequest(http.MethodGet, "/executors", nil)
+	req.AddCookie(&http.Cookie{Name: sessionCookieName, Value: expiredIDToken})
+	rec := httptest.NewRecorder()
+	protected.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusUnauthorized {
+		t.Fatalf("status = %d, want 401", rec.Code)
+	}
 }
