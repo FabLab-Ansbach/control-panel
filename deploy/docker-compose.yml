@@ -1,0 +1,8 @@
+services:
+  control-panel:
+    image: ghcr.io/fablab-ansbach/control-panel:latest
+    restart: unless-stopped
+    ports:
+      - "8090:8090"
+    volumes:
+      - ./config.yaml:/app/config.yaml:ro
