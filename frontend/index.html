@@ -21,26 +21,173 @@
 <body>
   <header>
     <h1>Executors</h1>
-    <a href="/auth/logout">Logout</a>
+    <a href="#" id="logout">Logout</a>
   </header>
   <div id="executors">Loading…</div>
 
 <script>
-function redirectToLogin() {
-  window.location.href = "/auth/login";
+// The frontend is its own public OIDC client (Authorization Code + PKCE, no
+// client secret). Where to authenticate and which client_id to use come
+// from the backend (GET /auth/config, same-origin, no CORS involved) rather
+// than being hardcoded here. Login itself is a top-level redirect to
+// authentik (never subject to CORS either way), but the actual token
+// requests (code exchange, refresh) go through the backend's /auth/token
+// pass-through: this deployment's authentik doesn't send CORS headers on
+// real (non-preflight) responses, so the browser can't fetch() it directly
+// - see the comment on authn.TokenProxyHandler in the backend for the full
+// story.
+let authConfigPromise = null;
+function getAuthConfig() {
+  authConfigPromise ??= fetch("/auth/config").then((r) => r.json());
+  return authConfigPromise;
+}
+
+function base64url(bytes) {
+  let str = "";
+  for (const b of bytes) str += String.fromCharCode(b);
+  return btoa(str).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
+}
+
+function randomString() {
+  const bytes = new Uint8Array(32);
+  crypto.getRandomValues(bytes);
+  return base64url(bytes);
+}
+
+async function codeChallengeFor(verifier) {
+  const digest = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(verifier));
+  return base64url(new Uint8Array(digest));
+}
+
+function redirectURI() {
+  return new URL("/", location.href).toString();
+}
+
+async function redirectToLogin() {
+  sessionStorage.removeItem("accessToken");
+  sessionStorage.removeItem("refreshToken");
+
+  const { authorizationEndpoint, clientId } = await getAuthConfig();
+  const verifier = randomString();
+  const state = randomString();
+  sessionStorage.setItem("pkceVerifier", verifier);
+  sessionStorage.setItem("pkceState", state);
+
+  const params = new URLSearchParams({
+    response_type: "code",
+    client_id: clientId,
+    redirect_uri: redirectURI(),
+    scope: "openid profile groups offline_access",
+    state,
+    code_challenge: await codeChallengeFor(verifier),
+    code_challenge_method: "S256",
+  });
+  window.location.href = `${authorizationEndpoint}?${params}`;
   throw new Error("redirecting to login");
 }
 
+document.getElementById("logout").onclick = (event) => {
+  event.preventDefault();
+  redirectToLogin();
+};
+
+// If we just came back from authentik with ?code=&state=, exchange the code
+// for tokens (PKCE substitutes for a client secret here) and store them.
+async function completeLoginIfReturning() {
+  const params = new URLSearchParams(location.search);
+  const code = params.get("code");
+  const state = params.get("state");
+  if (!code) return;
+
+  const expectedState = sessionStorage.getItem("pkceState");
+  const verifier = sessionStorage.getItem("pkceVerifier");
+  sessionStorage.removeItem("pkceState");
+  sessionStorage.removeItem("pkceVerifier");
+  history.replaceState(null, "", location.pathname);
+  if (!verifier || state !== expectedState) throw new Error("OIDC state mismatch");
+
+  const { tokenEndpoint, clientId } = await getAuthConfig();
+  const res = await fetch(tokenEndpoint, {
+    method: "POST",
+    headers: { "Content-Type": "application/x-www-form-urlencoded" },
+    body: new URLSearchParams({
+      grant_type: "authorization_code",
+      client_id: clientId,
+      code,
+      redirect_uri: redirectURI(),
+      code_verifier: verifier,
+    }),
+  });
+  if (!res.ok) throw new Error(`token exchange failed: ${res.status}`);
+
+  const tokens = await res.json();
+  sessionStorage.setItem("accessToken", tokens.access_token);
+  sessionStorage.setItem("refreshToken", tokens.refresh_token || "");
+}
+
+// The periodic poll and a user-triggered request can both hit a 401 for the
+// same expired token around the same time. Without coordination they'd each
+// call this and race: authentik commonly rotates (invalidates) the
+// refresh_token on use, so whichever call loses the race would present an
+// already-consumed refresh_token and get rejected. Sharing one in-flight
+// promise means concurrent callers all await the same single refresh
+// instead of racing each other.
+let refreshPromise = null;
+function refreshTokens() {
+  refreshPromise ??= doRefresh().finally(() => { refreshPromise = null; });
+  return refreshPromise;
+}
+
+async function doRefresh() {
+  const refreshToken = sessionStorage.getItem("refreshToken");
+  if (!refreshToken) return false;
+
+  const { tokenEndpoint, clientId } = await getAuthConfig();
+  const res = await fetch(tokenEndpoint, {
+    method: "POST",
+    headers: { "Content-Type": "application/x-www-form-urlencoded" },
+    body: new URLSearchParams({
+      grant_type: "refresh_token",
+      client_id: clientId,
+      refresh_token: refreshToken,
+    }),
+  });
+  if (!res.ok) return false;
+
+  const tokens = await res.json();
+  sessionStorage.setItem("accessToken", tokens.access_token);
+  sessionStorage.setItem("refreshToken", tokens.refresh_token || refreshToken);
+  return true;
+}
+
+// Attaches the access token, and on a 401 tries one silent refresh + retry
+// before giving up and sending the user back through login.
+async function authFetch(path, opts = {}) {
+  const accessToken = sessionStorage.getItem("accessToken");
+  if (!accessToken) return redirectToLogin();
+
+  const withAuth = (token) => fetch(path, {
+    ...opts,
+    headers: { ...opts.headers, Authorization: `Bearer ${token}` },
+  });
+
+  let res = await withAuth(accessToken);
+  if (res.status === 401) {
+    if (!(await refreshTokens())) return redirectToLogin();
+    res = await withAuth(sessionStorage.getItem("accessToken"));
+    if (res.status === 401) return redirectToLogin();
+  }
+  return res;
+}
+
 async function fetchExecutors() {
-  const res = await fetch("/executors/");
-  if (res.status === 401) return redirectToLogin();
+  const res = await authFetch("/executors/");
   if (!res.ok) throw new Error(`GET /executors failed: ${res.status}`);
   return res.json();
 }
 
 async function executeExecutor(name) {
-  const res = await fetch(`/executors/${encodeURIComponent(name)}/execute`, { method: "POST" });
-  if (res.status === 401) return redirectToLogin();
+  const res = await authFetch(`/executors/${encodeURIComponent(name)}/execute`, { method: "POST" });
   return res.json();
 }
 
@@ -108,8 +255,18 @@ async function refresh() {
   }
 }
 
-refresh();
-setInterval(refresh, 5000);
+async function start() {
+  try {
+    await completeLoginIfReturning();
+  } catch (err) {
+    document.getElementById("executors").textContent = String(err);
+    return;
+  }
+  refresh();
+  setInterval(refresh, 5000);
+}
+
+start();
 </script>
 </body>
 </html>

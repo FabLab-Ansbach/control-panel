@@ -59,6 +59,6 @@ func newOPNSenseAliasToggler(definition config.ExecutorDefinition, availableConn
 		return nil, fmt.Errorf("connector %s has incompatible type %T for executor %s", executorCfg.ConnectorName, connector, executorCfg.Name)
 	}
 
-	toggler := NewOPNSenseAliasToggler(executorCfg.Name, opnsenseConnector, executorCfg.AliasName, executorCfg.ToggleValue)
+	toggler := NewOPNSenseAliasToggler(executorCfg.Name, opnsenseConnector, executorCfg.AliasName, executorCfg.ToggleValues)
 	return toggler, nil
 }

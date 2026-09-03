@@ -11,4 +11,5 @@ executors:
     type: opnsenseAliasToggle
     connectorName: firewall
     aliasName: workshop-clients
-    toggleValue: 10.0.10.55
+    toggleValues:
+      - 10.0.10.55

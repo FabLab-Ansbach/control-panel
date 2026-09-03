@@ -41,7 +41,7 @@ func TestGetExecutors(t *testing.T) {
 					Type:          config.ExecutorTypeOPNSenseAliasToggle,
 					ConnectorName: "main",
 					AliasName:     "test-alias",
-					ToggleValue:   "enable",
+					ToggleValues:  []string{"enable"},
 				},
 			},
 		}
@@ -73,7 +73,7 @@ func TestGetExecutors(t *testing.T) {
 					Type:          config.ExecutorTypeOPNSenseAliasToggle,
 					ConnectorName: "main",
 					AliasName:     "test-alias",
-					ToggleValue:   "enable",
+					ToggleValues:  []string{"enable"},
 				},
 			},
 		}

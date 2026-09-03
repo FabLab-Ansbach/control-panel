@@ -5,8 +5,10 @@ import (
 	"crypto/rand"
 	"crypto/rsa"
 	"encoding/json"
+	"io"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 
@@ -17,12 +19,15 @@ import (
 	"github.com/FabLab-Ansbach/control-panel/internal/config"
 )
 
-// fakeProvider is a minimal OIDC provider: discovery doc, JWKS, and a token
-// endpoint that always issues a token for whatever claims the test wants.
+// fakeProvider is a minimal OIDC provider: discovery doc, JWKS, and a /token
+// endpoint that echoes back whatever it received (for TokenProxyHandler
+// pass-through tests) plus a fixed status/body when tokenResponse is set.
 type fakeProvider struct {
-	srv    *httptest.Server
-	key    *rsa.PrivateKey
-	claims map[string]any // claims for the next /token response's id_token
+	srv         *httptest.Server
+	key         *rsa.PrivateKey
+	tokenStatus int
+	tokenBody   string
+	lastReqBody string
 }
 
 func newFakeProvider(t *testing.T) *fakeProvider {
@@ -47,15 +52,21 @@ func newFakeProvider(t *testing.T) *fakeProvider {
 		json.NewEncoder(w).Encode(jose.JSONWebKeySet{Keys: []jose.JSONWebKey{jwk}})
 	})
 	mux.HandleFunc("/token", func(w http.ResponseWriter, r *http.Request) {
-		idToken := fp.sign(t, fp.claims)
+		body, _ := io.ReadAll(r.Body)
+		fp.lastReqBody = string(body)
+
+		if r.Header.Get("Content-Type") != "application/x-www-form-urlencoded" {
+			http.Error(w, "unexpected content-type", http.StatusBadRequest)
+			return
+		}
+
+		status := fp.tokenStatus
+		if status == 0 {
+			status = http.StatusOK
+		}
 		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode(map[string]any{
-			"access_token":  "unused-access-token",
-			"id_token":      idToken,
-			"refresh_token": "fake-refresh-token",
-			"token_type":    "Bearer",
-			"expires_in":    3600,
-		})
+		w.WriteHeader(status)
+		w.Write([]byte(fp.tokenBody))
 	})
 
 	fp.srv = httptest.NewServer(mux)
@@ -78,10 +89,6 @@ func (fp *fakeProvider) sign(t *testing.T, claims map[string]any) string {
 	return raw
 }
 
-func baseClaims(fp *fakeProvider, audience string, groups []string) map[string]any {
-	return claimsWithTTL(fp, audience, groups, time.Hour)
-}
-
 func claimsWithTTL(fp *fakeProvider, audience string, groups []string, ttl time.Duration) map[string]any {
 	now := time.Now()
 	return map[string]any{
@@ -94,13 +101,69 @@ func claimsWithTTL(fp *fakeProvider, audience string, groups []string, ttl time.
 	}
 }
 
+const testClientID = "gui-public-client"
+
 func newTestAuthenticator(t *testing.T, fp *fakeProvider) *Authenticator {
 	t.Helper()
+	auth, err := New(context.Background(), config.OIDCAuthConfig{IssuerURL: fp.srv.URL, ClientID: testClientID})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return auth
+}
+
+func TestRequireAuthAcceptsValidBearerToken(t *testing.T) {
+	fp := newFakeProvider(t)
+	auth := newTestAuthenticator(t, fp)
+
+	token := fp.sign(t, claimsWithTTL(fp, testClientID, []string{"fablab-admins"}, time.Hour))
+
+	var gotGroups []string
+	protected := auth.RequireAuth(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotGroups = GroupsFromContext(r.Context())
+	}))
+
+	req := httptest.NewRequest(http.MethodGet, "/executors", nil)
+	req.Header.Set("Authorization", "Bearer "+token)
+	rec := httptest.NewRecorder()
+	protected.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200", rec.Code)
+	}
+	if len(gotGroups) != 1 || gotGroups[0] != "fablab-admins" {
+		t.Fatalf("groups = %v, want [fablab-admins]", gotGroups)
+	}
+}
+
+func TestRequireAuthRejectsExpiredToken(t *testing.T) {
+	fp := newFakeProvider(t)
+	auth := newTestAuthenticator(t, fp)
+
+	expired := fp.sign(t, claimsWithTTL(fp, testClientID, []string{"fablab-admins"}, -time.Minute))
+	protected := auth.RequireAuth(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {}))
+
+	req := httptest.NewRequest(http.MethodGet, "/executors", nil)
+	req.Header.Set("Authorization", "Bearer "+expired)
+	rec := httptest.NewRecorder()
+	protected.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusUnauthorized {
+		t.Fatalf("status = %d, want 401", rec.Code)
+	}
+}
+
+// newTestAuthenticatorWithM2M builds an Authenticator with one M2M client
+// backed by its own fake provider, mirroring Authentik where each M2M
+// client is its own Application/Provider with a distinct issuer.
+func newTestAuthenticatorWithM2M(t *testing.T, fp *fakeProvider, m2mFP *fakeProvider, m2mClientID string) *Authenticator {
+	t.Helper()
 	auth, err := New(context.Background(), config.OIDCAuthConfig{
-		IssuerURL:    fp.srv.URL,
-		ClientID:     "gui-client",
-		ClientSecret: "gui-secret",
-		RedirectURL:  "http://panel.local/auth/callback",
+		IssuerURL: fp.srv.URL,
+		ClientID:  testClientID,
+		M2MClients: []config.M2MClientConfig{
+			{ClientID: m2mClientID, IssuerURL: m2mFP.srv.URL},
+		},
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -108,154 +171,12 @@ func newTestAuthenticator(t *testing.T, fp *fakeProvider) *Authenticator {
 	return auth
 }
 
-func TestLoginCallbackEstablishesSession(t *testing.T) {
+func TestRequireAuthAcceptsM2MClientAndExposesItAsAGroup(t *testing.T) {
 	fp := newFakeProvider(t)
-	auth := newTestAuthenticator(t, fp)
-	fp.claims = baseClaims(fp, "gui-client", []string{"fablab-admins"})
+	m2mFP := newFakeProvider(t)
+	auth := newTestAuthenticatorWithM2M(t, fp, m2mFP, "approved-m2m-client")
 
-	// GET /auth/login
-	loginRec := httptest.NewRecorder()
-	auth.LoginHandler(loginRec, httptest.NewRequest(http.MethodGet, "/auth/login", nil))
-	if loginRec.Code != http.StatusFound {
-		t.Fatalf("login status = %d, want %d", loginRec.Code, http.StatusFound)
-	}
-	loginResp := loginRec.Result()
-	redirectURL, err := loginResp.Location()
-	if err != nil {
-		t.Fatal(err)
-	}
-	state := redirectURL.Query().Get("state")
-	if state == "" {
-		t.Fatal("expected state param in authorize redirect")
-	}
-	var stateCookie *http.Cookie
-	for _, c := range loginResp.Cookies() {
-		if c.Name == stateCookieName {
-			stateCookie = c
-		}
-	}
-	if stateCookie == nil {
-		t.Fatal("expected oauth_state cookie to be set")
-	}
-
-	// GET /auth/callback?code=...&state=...
-	callbackReq := httptest.NewRequest(http.MethodGet, "/auth/callback?code=test-code&state="+state, nil)
-	callbackReq.AddCookie(stateCookie)
-	callbackRec := httptest.NewRecorder()
-	auth.CallbackHandler(callbackRec, callbackReq)
-
-	callbackResp := callbackRec.Result()
-	if callbackResp.StatusCode != http.StatusFound {
-		body, _ := json.Marshal(callbackRec.Body.String())
-		t.Fatalf("callback status = %d, want %d, body=%s", callbackResp.StatusCode, http.StatusFound, body)
-	}
-	var sessionCookie, refreshCookie *http.Cookie
-	for _, c := range callbackResp.Cookies() {
-		switch c.Name {
-		case sessionCookieName:
-			sessionCookie = c
-		case refreshCookieName:
-			refreshCookie = c
-		}
-	}
-	if sessionCookie == nil || sessionCookie.Value == "" {
-		t.Fatal("expected session cookie (the raw id_token) to be set")
-	}
-	if refreshCookie == nil || refreshCookie.Value == "" {
-		t.Fatal("expected refresh cookie to be set")
-	}
-
-	// A request carrying the session cookie should authenticate as the GUI user's groups.
-	var gotGroups []string
-	protected := auth.RequireAuth(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		gotGroups = GroupsFromContext(r.Context())
-	}))
-	req := httptest.NewRequest(http.MethodGet, "/executors", nil)
-	req.AddCookie(sessionCookie)
-	rec := httptest.NewRecorder()
-	protected.ServeHTTP(rec, req)
-
-	if rec.Code != http.StatusOK {
-		t.Fatalf("protected route status = %d, want 200", rec.Code)
-	}
-	if len(gotGroups) != 1 || gotGroups[0] != "fablab-admins" {
-		t.Fatalf("groups = %v, want [fablab-admins]", gotGroups)
-	}
-}
-
-func TestCallbackRejectsMismatchedState(t *testing.T) {
-	fp := newFakeProvider(t)
-	auth := newTestAuthenticator(t, fp)
-	fp.claims = baseClaims(fp, "gui-client", []string{"fablab-admins"})
-
-	req := httptest.NewRequest(http.MethodGet, "/auth/callback?code=test-code&state=wrong", nil)
-	req.AddCookie(&http.Cookie{Name: stateCookieName, Value: "correct"})
-	rec := httptest.NewRecorder()
-	auth.CallbackHandler(rec, req)
-
-	if rec.Code != http.StatusBadRequest {
-		t.Fatalf("status = %d, want %d", rec.Code, http.StatusBadRequest)
-	}
-}
-
-func TestRequireAuthBearerToken(t *testing.T) {
-	fp := newFakeProvider(t)
-	auth := newTestAuthenticator(t, fp)
-
-	var gotGroups []string
-	protected := auth.RequireAuth(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		gotGroups = GroupsFromContext(r.Context())
-	}))
-
-	t.Run("valid m2m token is accepted regardless of audience", func(t *testing.T) {
-		token := fp.sign(t, baseClaims(fp, "any-client-registered-in-our-authentik", []string{"fablab-members"}))
-		req := httptest.NewRequest(http.MethodGet, "/executors", nil)
-		req.Header.Set("Authorization", "Bearer "+token)
-		rec := httptest.NewRecorder()
-		protected.ServeHTTP(rec, req)
-
-		if rec.Code != http.StatusOK {
-			t.Fatalf("status = %d, want 200", rec.Code)
-		}
-		if len(gotGroups) != 1 || gotGroups[0] != "fablab-members" {
-			t.Fatalf("groups = %v, want [fablab-members]", gotGroups)
-		}
-	})
-
-	t.Run("token from a different issuer is rejected", func(t *testing.T) {
-		otherProvider := newFakeProvider(t)
-		token := otherProvider.sign(t, baseClaims(otherProvider, "whatever-client", []string{"fablab-members"}))
-		req := httptest.NewRequest(http.MethodGet, "/executors", nil)
-		req.Header.Set("Authorization", "Bearer "+token)
-		rec := httptest.NewRecorder()
-		protected.ServeHTTP(rec, req)
-
-		if rec.Code != http.StatusUnauthorized {
-			t.Fatalf("status = %d, want 401", rec.Code)
-		}
-	})
-
-	t.Run("no credentials at all is rejected", func(t *testing.T) {
-		req := httptest.NewRequest(http.MethodGet, "/executors", nil)
-		rec := httptest.NewRecorder()
-		protected.ServeHTTP(rec, req)
-
-		if rec.Code != http.StatusUnauthorized {
-			t.Fatalf("status = %d, want 401", rec.Code)
-		}
-	})
-}
-
-func TestExpiredSessionIsSilentlyRefreshed(t *testing.T) {
-	fp := newFakeProvider(t)
-	auth := newTestAuthenticator(t, fp)
-
-	expiredIDToken := fp.sign(t, claimsWithTTL(fp, "gui-client", []string{"fablab-admins"}, -time.Minute))
-
-	// The refresh endpoint will hand back fresh claims - a different set of
-	// groups, so we can prove the refreshed token (not the stale cookie) is
-	// what actually got used for authorization.
-	fp.claims = baseClaims(fp, "gui-client", []string{"fablab-members"})
+	token := m2mFP.sign(t, claimsWithTTL(m2mFP, "approved-m2m-client", nil, time.Hour))
 
 	var gotGroups []string
 	protected := auth.RequireAuth(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -263,43 +184,180 @@ func TestExpiredSessionIsSilentlyRefreshed(t *testing.T) {
 	}))
 
 	req := httptest.NewRequest(http.MethodGet, "/executors", nil)
-	req.AddCookie(&http.Cookie{Name: sessionCookieName, Value: expiredIDToken})
-	req.AddCookie(&http.Cookie{Name: refreshCookieName, Value: "some-refresh-token"})
+	req.Header.Set("Authorization", "Bearer "+token)
 	rec := httptest.NewRecorder()
 	protected.ServeHTTP(rec, req)
 
 	if rec.Code != http.StatusOK {
-		t.Fatalf("status = %d, want 200, body=%s", rec.Code, rec.Body.String())
+		t.Fatalf("status = %d, want 200", rec.Code)
 	}
-	if len(gotGroups) != 1 || gotGroups[0] != "fablab-members" {
-		t.Fatalf("groups = %v, want [fablab-members] (from the refreshed token)", gotGroups)
-	}
-
-	var newSessionCookie *http.Cookie
-	for _, c := range rec.Result().Cookies() {
-		if c.Name == sessionCookieName {
-			newSessionCookie = c
-		}
-	}
-	if newSessionCookie == nil || newSessionCookie.Value == expiredIDToken {
-		t.Fatal("expected a new, different session cookie to be set after refresh")
+	if len(gotGroups) != 1 || gotGroups[0] != "approved-m2m-client" {
+		t.Fatalf("groups = %v, want [approved-m2m-client]", gotGroups)
 	}
 }
 
-func TestExpiredSessionWithoutRefreshCookieIsRejected(t *testing.T) {
+func TestRequireAuthRejectsUnapprovedM2MClient(t *testing.T) {
 	fp := newFakeProvider(t)
-	auth := newTestAuthenticator(t, fp)
+	m2mFP := newFakeProvider(t)
+	auth := newTestAuthenticatorWithM2M(t, fp, m2mFP, "approved-m2m-client")
 
-	expiredIDToken := fp.sign(t, claimsWithTTL(fp, "gui-client", []string{"fablab-admins"}, -time.Minute))
-
+	// Signed by the approved M2M issuer, but for a different client_id -
+	// must not be accepted.
+	token := m2mFP.sign(t, claimsWithTTL(m2mFP, "some-other-client", nil, time.Hour))
 	protected := auth.RequireAuth(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {}))
 
 	req := httptest.NewRequest(http.MethodGet, "/executors", nil)
-	req.AddCookie(&http.Cookie{Name: sessionCookieName, Value: expiredIDToken})
+	req.Header.Set("Authorization", "Bearer "+token)
 	rec := httptest.NewRecorder()
 	protected.ServeHTTP(rec, req)
 
 	if rec.Code != http.StatusUnauthorized {
 		t.Fatalf("status = %d, want 401", rec.Code)
+	}
+}
+
+func TestRequireAuthRejectsTokenFromUnknownIssuerEvenWithApprovedAudience(t *testing.T) {
+	fp := newFakeProvider(t)
+	m2mFP := newFakeProvider(t)
+	auth := newTestAuthenticatorWithM2M(t, fp, m2mFP, "approved-m2m-client")
+
+	// Signed by some unrelated issuer, with the right audience - must not
+	// be accepted; issuer, not just client_id, is what scopes trust.
+	otherProvider := newFakeProvider(t)
+	token := otherProvider.sign(t, claimsWithTTL(otherProvider, "approved-m2m-client", nil, time.Hour))
+	protected := auth.RequireAuth(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {}))
+
+	req := httptest.NewRequest(http.MethodGet, "/executors", nil)
+	req.Header.Set("Authorization", "Bearer "+token)
+	rec := httptest.NewRecorder()
+	protected.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusUnauthorized {
+		t.Fatalf("status = %d, want 401", rec.Code)
+	}
+}
+
+func TestRequireAuthRejectsWrongAudience(t *testing.T) {
+	fp := newFakeProvider(t)
+	auth := newTestAuthenticator(t, fp)
+
+	// Validly signed by our own issuer, but minted for some other
+	// application - must not be accepted here.
+	token := fp.sign(t, claimsWithTTL(fp, "some-other-application", []string{"fablab-admins"}, time.Hour))
+	protected := auth.RequireAuth(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {}))
+
+	req := httptest.NewRequest(http.MethodGet, "/executors", nil)
+	req.Header.Set("Authorization", "Bearer "+token)
+	rec := httptest.NewRecorder()
+	protected.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusUnauthorized {
+		t.Fatalf("status = %d, want 401", rec.Code)
+	}
+}
+
+func TestRequireAuthRejectsTokenFromDifferentIssuer(t *testing.T) {
+	fp := newFakeProvider(t)
+	auth := newTestAuthenticator(t, fp)
+
+	otherProvider := newFakeProvider(t)
+	token := otherProvider.sign(t, claimsWithTTL(otherProvider, "whatever-client", []string{"fablab-admins"}, time.Hour))
+
+	protected := auth.RequireAuth(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {}))
+
+	req := httptest.NewRequest(http.MethodGet, "/executors", nil)
+	req.Header.Set("Authorization", "Bearer "+token)
+	rec := httptest.NewRecorder()
+	protected.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusUnauthorized {
+		t.Fatalf("status = %d, want 401", rec.Code)
+	}
+}
+
+func TestRequireAuthRejectsNoCredentials(t *testing.T) {
+	fp := newFakeProvider(t)
+	auth := newTestAuthenticator(t, fp)
+
+	protected := auth.RequireAuth(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {}))
+
+	req := httptest.NewRequest(http.MethodGet, "/executors", nil)
+	rec := httptest.NewRecorder()
+	protected.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusUnauthorized {
+		t.Fatalf("status = %d, want 401", rec.Code)
+	}
+}
+
+func TestTokenProxyHandlerForwardsBodyAndReturnsResponse(t *testing.T) {
+	fp := newFakeProvider(t)
+	auth := newTestAuthenticator(t, fp)
+	fp.tokenStatus = http.StatusOK
+	fp.tokenBody = `{"access_token":"abc","refresh_token":"def"}`
+
+	reqBody := "grant_type=authorization_code&client_id=gui-public-client&code=xyz&code_verifier=verifier123"
+	req := httptest.NewRequest(http.MethodPost, "/auth/token", strings.NewReader(reqBody))
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	rec := httptest.NewRecorder()
+	auth.TokenProxyHandler(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200, body=%s", rec.Code, rec.Body.String())
+	}
+	if rec.Body.String() != fp.tokenBody {
+		t.Fatalf("body = %q, want %q (should be an unmodified pass-through)", rec.Body.String(), fp.tokenBody)
+	}
+	if fp.lastReqBody != reqBody {
+		t.Fatalf("authentik received %q, want %q (should forward the request unmodified)", fp.lastReqBody, reqBody)
+	}
+	if ct := rec.Header().Get("Content-Type"); ct != "application/json" {
+		t.Fatalf("Content-Type = %q, want application/json", ct)
+	}
+}
+
+func TestTokenProxyHandlerForwardsErrorStatus(t *testing.T) {
+	fp := newFakeProvider(t)
+	auth := newTestAuthenticator(t, fp)
+	fp.tokenStatus = http.StatusBadRequest
+	fp.tokenBody = `{"error":"invalid_grant"}`
+
+	req := httptest.NewRequest(http.MethodPost, "/auth/token", strings.NewReader("grant_type=refresh_token&refresh_token=stale"))
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	rec := httptest.NewRecorder()
+	auth.TokenProxyHandler(rec, req)
+
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400 (should mirror authentik's status)", rec.Code)
+	}
+	if rec.Body.String() != fp.tokenBody {
+		t.Fatalf("body = %q, want %q", rec.Body.String(), fp.tokenBody)
+	}
+}
+
+func TestConfigHandlerReportsWhereToAuthenticate(t *testing.T) {
+	fp := newFakeProvider(t)
+	auth := newTestAuthenticator(t, fp)
+
+	req := httptest.NewRequest(http.MethodGet, "/auth/config", nil)
+	rec := httptest.NewRecorder()
+	auth.ConfigHandler(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200", rec.Code)
+	}
+
+	var resp authConfigResponse
+	if err := json.NewDecoder(rec.Body).Decode(&resp); err != nil {
+		t.Fatal(err)
+	}
+	if resp.AuthorizationEndpoint != fp.srv.URL+"/authorize" {
+		t.Errorf("authorizationEndpoint = %q, want %q", resp.AuthorizationEndpoint, fp.srv.URL+"/authorize")
+	}
+	if resp.TokenEndpoint != "/auth/token" {
+		t.Errorf("tokenEndpoint = %q, want /auth/token (our own proxy, not authentik's)", resp.TokenEndpoint)
+	}
+	if resp.ClientID != testClientID {
+		t.Errorf("clientId = %q, want %q", resp.ClientID, testClientID)
 	}
 }

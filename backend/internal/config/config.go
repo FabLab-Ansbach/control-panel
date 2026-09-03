@@ -19,13 +19,36 @@ type Config struct {
 	Permissions PermissionsConfig `yaml:"permissions"`
 	// FrontendDir, if set, serves the static GUI from this directory at "/".
 	FrontendDir string `yaml:"frontendDir"`
+	// ListenAddr is the interface to bind to; empty means all interfaces.
+	ListenAddr string `yaml:"listenAddr"`
+	// ListenPort defaults to 8090 if unset.
+	ListenPort int `yaml:"listenPort"`
 }
 
+// OIDCAuthConfig is all the backend needs to be a pure resource server: it
+// verifies bearer tokens against the issuer's JWKS. It never talks to the
+// token endpoint or holds a client secret — the frontend (and anything else
+// calling the API) is its own public OIDC client and fetches its own tokens.
 type OIDCAuthConfig struct {
-	IssuerURL    string `yaml:"issuerUrl" validate:"required"`
-	ClientID     string `yaml:"clientId" validate:"required"`
-	ClientSecret string `yaml:"clientSecret" validate:"required"`
-	RedirectURL  string `yaml:"redirectUrl" validate:"required"`
+	IssuerURL string `yaml:"issuerUrl" validate:"required"`
+	// ClientID is the frontend's public OIDC client ID — also the default
+	// accepted token audience.
+	ClientID string `yaml:"clientId" validate:"required"`
+	// M2MClients lists additional OIDC clients accepted for
+	// machine-to-machine callers using the client credentials grant. Each
+	// is authorized via `permissions`, exactly like an OIDC group — add an
+	// entry keyed by the client_id.
+	M2MClients []M2MClientConfig `yaml:"m2mClients"`
+}
+
+// M2MClientConfig is one machine-to-machine OIDC client accepted alongside
+// the frontend's. In Authentik, a client credentials grant is issued by its
+// own Application/Provider, which has its own issuer URL (and audience
+// equal to its client_id) — so unlike the frontend, each M2M client needs
+// its issuer spelled out too.
+type M2MClientConfig struct {
+	ClientID  string `yaml:"clientId" validate:"required"`
+	IssuerURL string `yaml:"issuerUrl" validate:"required"`
 }
 
 // PermissionsConfig maps an OIDC group name to what it may do.
@@ -91,8 +114,8 @@ type OPNSenseAliasToggleExecutorCfg struct {
 	Name          string `yaml:"-" validate:"required"`
 	Type          string `yaml:"type" validate:"required"`
 	ConnectorName string `yaml:"connectorName" validate:"required"`
-	AliasName     string `yaml:"aliasName" validate:"required"`
-	ToggleValue   string `yaml:"toggleValue" validate:"required"`
+	AliasName     string   `yaml:"aliasName" validate:"required"`
+	ToggleValues  []string `yaml:"toggleValues" validate:"required"`
 }
 
 func (c *OPNSenseConnectorCfg) ConnectorType() string {
@@ -249,7 +272,8 @@ func validateRequiredFields(value reflect.Value) error {
 			field := typeInfo.Field(index)
 			fieldValue := value.Field(index)
 
-			if field.Tag.Get("validate") == "required" && fieldValue.IsZero() {
+			isEmptyCollection := (fieldValue.Kind() == reflect.Slice || fieldValue.Kind() == reflect.Map) && fieldValue.Len() == 0
+			if field.Tag.Get("validate") == "required" && (fieldValue.IsZero() || isEmptyCollection) {
 				return fmt.Errorf("required config field %q is missing", field.Name)
 			}
 
